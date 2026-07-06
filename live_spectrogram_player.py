@@ -2,6 +2,15 @@
 """
 Live spectrogram audio player.
 
+The application is intentionally kept in one file so public builds are easy to
+audit. The main flow is:
+
+1. CustomTkinter builds the controls and embeds a Matplotlib spectrogram canvas.
+2. soundfile loads local audio after size/type/metadata safety checks.
+3. sounddevice plays the selected file and can capture a direct input stream.
+4. soundcard captures speaker loopback when the user wants post-processing.
+5. A small ring buffer feeds a background FFT worker so the UI stays responsive.
+
 Dependencies:
     python -m pip install numpy matplotlib sounddevice soundfile
 
@@ -43,6 +52,8 @@ APP_VERSION = "1.0.0"
 RETURN_MIX_MODE = "2.1 L+R+Sub"
 RETURN_SOURCE_LABEL = "Hardware 2.1 return"
 APP_ICON_PATH = ("assets", "app_icon.ico")
+
+# UI palette shared by CustomTkinter controls and the Matplotlib frame.
 APP_BG = "#151820"
 PANEL_BG = "#202633"
 PANEL_SUBTLE_BG = "#2a3140"
@@ -54,11 +65,18 @@ ACCENT_HOVER = "#2576bb"
 TEXT_PRIMARY = "#eef2f7"
 TEXT_MUTED = "#aeb8c7"
 GRAPH_BG = "#0c0d10"
+
+# Live capture is intentionally chunked differently for direct input and
+# speaker loopback. Loopback wakes less often, which helps window dragging and
+# general UI responsiveness while preserving the moving spectrogram.
 LIVE_INPUT_BLOCK_SECONDS = 0.04
 LOOPBACK_BLOCK_SECONDS = 0.10
 WINDOW_INTERACTION_PAUSE_SECONDS = 0.18
 MAX_VISUAL_CHUNKS_PER_UI_TICK = 24
 SPEK_DISPLAY_GAIN_DB = -7.0
+
+# File-loading guardrails. They reject accidental huge files and malformed
+# metadata before the decoder allocates the playback buffer.
 SUPPORTED_AUDIO_EXTENSIONS = frozenset((".wav", ".flac", ".ogg", ".aiff", ".aif", ".mp3"))
 MAX_AUDIO_FILE_BYTES = 3 * 1024 * 1024 * 1024
 MAX_DECODED_AUDIO_BYTES = 2 * 1024 * 1024 * 1024
@@ -85,6 +103,8 @@ LIVE_SAMPLE_RATE_OPTIONS = (
 )
 COLORBAR_DB_TICKS = (-120, -100, -80, -60, -40, -20, 0)
 COLORBAR_DB_LABELS = tuple(f"{tick} dB" for tick in COLORBAR_DB_TICKS)
+
+# Hand-tuned colour stops that mimic Spek's classic dark heatmap.
 SPEK_COLOR_STOPS = (
     (0.000000, "#000007"),  # -120 dB
     (0.083333, "#00003c"),  # -110 dB
@@ -144,7 +164,12 @@ def format_bytes(value: int) -> str:
 
 
 class LiveSpectrogramPlayer:
-    """Tkinter + sounddevice audio player with a scrolling spectrogram."""
+    """Owns the Tk UI, audio streams, capture workers, and spectrogram state.
+
+    Tkinter widgets are only touched from the GUI thread. Audio callbacks and
+    background workers communicate back through queues, which `_update_gui()`
+    drains on a short timer.
+    """
 
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
@@ -271,6 +296,7 @@ class LiveSpectrogramPlayer:
     # ---------- UI ----------
 
     def _set_window_icon(self) -> None:
+        """Apply the bundled icon when running from source or PyInstaller."""
         icon_path = app_resource_path(*APP_ICON_PATH)
         if not icon_path.exists():
             return
@@ -281,6 +307,7 @@ class LiveSpectrogramPlayer:
             pass
 
     def _build_ui(self) -> None:
+        """Create the controls and embedded Matplotlib spectrogram canvas."""
         heading_font = ctk.CTkFont(size=15, weight="bold")
         label_font = ctk.CTkFont(size=12)
         small_font = ctk.CTkFont(size=11)
@@ -734,6 +761,7 @@ class LiveSpectrogramPlayer:
         self.spectrogram_dirty = True
 
     def _install_native_window_move_hook(self) -> None:
+        """Pause expensive redraw work while Windows is moving/resizing us."""
         if sys.platform != "win32" or self.native_wndproc is not None:
             return
 
@@ -888,6 +916,7 @@ class LiveSpectrogramPlayer:
         self._start_spectrogram_render()
 
     def refresh_audio_devices(self) -> None:
+        """Refresh device labels and the lookup maps used by combo boxes."""
         try:
             devices = sd.query_devices()
             hostapis = sd.query_hostapis()
@@ -1517,6 +1546,7 @@ class LiveSpectrogramPlayer:
         return 2
 
     def _hardware_return_visual_channel(self, values: np.ndarray, mode: str) -> np.ndarray:
+        """Apply the user-selected 2.1 return channel map before drawing."""
         left, right, sub = self.return_channel_indices
         if mode == RETURN_MIX_MODE:
             return self._select_channel_indices(values, (left, right, sub))
@@ -1531,6 +1561,7 @@ class LiveSpectrogramPlayer:
         return self._visual_channel_by_mode(values, mode)
 
     def _visual_channel_by_mode(self, values: np.ndarray, mode: str) -> np.ndarray:
+        """Convert a multichannel block into the view requested by the UI."""
         if mode == RETURN_MIX_MODE:
             sub = self._default_sub_channel_index(values)
             if values.shape[1] == 1:
@@ -1568,6 +1599,7 @@ class LiveSpectrogramPlayer:
         return values.astype(np.float32, copy=False)
 
     def _visual_channel(self, samples: np.ndarray) -> np.ndarray:
+        """Normalize sample shape and route to the selected visual channel mode."""
         values = np.asarray(samples, dtype=np.float32)
         if values.ndim == 1:
             return values.reshape(-1)
@@ -1707,6 +1739,7 @@ class LiveSpectrogramPlayer:
 
     @staticmethod
     def _validate_audio_file_path(filename: str) -> Path:
+        """Resolve and reject unsupported or oversized user-selected files."""
         try:
             path = Path(filename).expanduser().resolve(strict=True)
         except OSError as exc:
@@ -1737,6 +1770,7 @@ class LiveSpectrogramPlayer:
 
     @staticmethod
     def _validate_audio_info(path: Path, info: Any) -> None:
+        """Check decoder metadata before allocating the playback buffer."""
         frames = max(0, int(getattr(info, "frames", 0) or 0))
         channels = max(0, int(getattr(info, "channels", 0) or 0))
         samplerate = max(0, int(getattr(info, "samplerate", 0) or 0))
@@ -1762,6 +1796,7 @@ class LiveSpectrogramPlayer:
 
     @staticmethod
     def _read_playback_audio(audio_file: Any) -> tuple[np.ndarray, int]:
+        """Read bounded blocks and keep only channels used for playback."""
         frames = int(getattr(audio_file, "frames", 0) or 0)
         channels = int(getattr(audio_file, "channels", 0) or 0)
         samplerate = int(getattr(audio_file, "samplerate", 0) or 0)
@@ -1832,6 +1867,7 @@ class LiveSpectrogramPlayer:
         ).start()
 
     def _load_audio_worker(self, token: int, filename: str) -> None:
+        """Decode audio off the GUI thread and return results through a queue."""
         try:
             audio_path = self._validate_audio_file_path(filename)
             with sf.SoundFile(str(audio_path), mode="r") as audio_file:
@@ -1924,6 +1960,7 @@ class LiveSpectrogramPlayer:
         source_rate: int,
         target_rate: int,
     ) -> np.ndarray:
+        """Resample playback audio when the output device requires it."""
         source_rate = int(source_rate)
         target_rate = int(target_rate)
         if source_rate == target_rate:
@@ -1941,6 +1978,7 @@ class LiveSpectrogramPlayer:
         return np.ascontiguousarray(resampled, dtype=np.float32)
 
     def _start_playback_resample(self, target_rate: int, *, auto_play: bool) -> bool:
+        """Start background resampling and preserve the current play position."""
         if self.audio is None or self.samplerate is None:
             return False
 
@@ -2221,6 +2259,7 @@ class LiveSpectrogramPlayer:
     def _open_capture_stream(
         self, device_index: int | None
     ) -> tuple[sd.InputStream, int, int]:
+        """Create a direct input stream using the selected/custom live rate."""
         device_info = sd.query_devices(device_index, "input")
         max_channels = max(1, int(device_info["max_input_channels"]))
         channels = min(max_channels, 8)
@@ -2404,6 +2443,7 @@ class LiveSpectrogramPlayer:
     def _loopback_worker(
         self, loopback_device: Any, samplerate: int, channels: int, block_frames: int
     ) -> None:
+        """Record speaker loopback in a worker thread and queue visual chunks."""
         com_initialized = False
         try:
             com_initialized = self._initialize_com_for_thread()
@@ -2553,6 +2593,7 @@ class LiveSpectrogramPlayer:
         return self.playback_samplerate or self.samplerate or 44_100
 
     def _reset_visual_buffer(self) -> None:
+        """Clear queued visual data and allocate a ring for the current view."""
         while True:
             try:
                 self.visual_queue.get_nowait()
@@ -2600,6 +2641,7 @@ class LiveSpectrogramPlayer:
         self.spectrogram_dirty = True
 
     def _append_to_ring(self, samples: np.ndarray) -> None:
+        """Append new visual samples into the fixed-size scrolling ring."""
         if samples.size == 0:
             return
 
@@ -2647,6 +2689,7 @@ class LiveSpectrogramPlayer:
         self.spectrogram_dirty = True
 
     def _ordered_ring_snapshot(self) -> np.ndarray:
+        """Return the ring in chronological order for the FFT worker."""
         if self.ring is None:
             return np.zeros((self.n_fft + self.hop_length, 1), dtype=np.float32)
         if self.ring_index == 0:
@@ -2708,6 +2751,7 @@ class LiveSpectrogramPlayer:
         db_floor: float,
         display_max_hz: float,
     ) -> tuple[np.ndarray, float]:
+        """Compute a dBFS spectrogram from one or more visual channels."""
         values = np.asarray(samples, dtype=np.float32)
         if values.ndim == 1:
             values = values.reshape(-1, 1)
@@ -2748,6 +2792,7 @@ class LiveSpectrogramPlayer:
         return np.clip(db, db_floor, 0.0).astype(np.float32, copy=False), max_hz
 
     def _start_spectrogram_render(self) -> None:
+        """Start a throttled background render when the ring has changed."""
         if self.ring is None or not self.spectrogram_dirty or self.spectrogram_rendering:
             return
         if self._window_interaction_active():
@@ -2795,6 +2840,7 @@ class LiveSpectrogramPlayer:
         window_seconds: float,
         invert_levels: bool,
     ) -> None:
+        """Run FFT work off-thread; `token` lets the GUI discard stale results."""
         try:
             db, max_hz = self._spectrogram_db_for_params(
                 samples,
@@ -2939,6 +2985,7 @@ class LiveSpectrogramPlayer:
             self._request_canvas_draw()
 
     def _update_gui(self) -> None:
+        """Drain worker queues, update widgets, and schedule the next UI tick."""
         window_busy = self._window_interaction_active()
         self._drain_load_results()
         self._drain_resample_results()
